@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../RTOS basics"
+		},
+		{
+			"name": "ADIS",
+			"path": "."
+		}
+	],
+	"settings": {}
+}

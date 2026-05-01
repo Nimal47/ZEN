@@ -1,0 +1,648 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include "time.h"
+#include <Adafruit_SSD1306.h>
+#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+#include "addons/RTDBHelper.h"
+#include "/Users/nimal/Documents/PROJEC/MP3/goodman.h" //path to Image Header File in C array Format
+#include "/Users/nimal/Documents/PROJEC/ADIS/src/secret.h" //path to your Credential folder 
+
+// --- WI-FI CREDENTIALS ---
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+
+// --- SYSTEM TIMING CONSTANTS ---
+#define TIMER_AUTOSTART_SEC   5      
+#define TIME_UP_DISPLAY_MS    5000   
+#define RFID_TIMEOUT_MS       2000   
+#define FOCUS_POPUP_MS        3000   
+#define SYNC_HOUR             23
+#define SYNC_MINUTE           30
+
+// --- PIN DEFINITIONS ---
+#define TFT_CS      5
+#define TFT_DC      2
+#define TFT_RST     4
+#define RFID_CS     21
+#define RFID_RST    22
+#define BTN_MODE    32 
+#define BTN_TIMER   33 
+
+#define OLED_SDA    25
+#define OLED_SCL    26
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// --- HARDWARE OBJECTS ---
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+MFRC522 mfrc522(RFID_CS, RFID_RST);
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// --- SHARED RTOS VARIABLES & LOCKS ---
+SemaphoreHandle_t spiMutex;
+
+// System Modes (NOW INCLUDES STOPWATCH)
+enum SystemMode { MODE_DEFAULT, MODE_TIMER, MODE_STOPWATCH, MODE_REMINDER };
+volatile SystemMode currentMode = MODE_DEFAULT;
+
+// --- MANUAL TIMER VARIABLES ---
+volatile int timerMinutes = 1;  
+volatile TickType_t lastTimerInteractionTick = 0; 
+volatile bool isTimerRunning = false;             
+volatile TickType_t timerStartTick = 0;           
+volatile TickType_t timeUpStartTick = 0; 
+
+// Focus Session Data
+struct FocusSession {
+    String startTime;
+    String endTime;
+    int durationSec;
+};
+
+std::vector<FocusSession> dailyLog;
+struct Reminder {
+    String time;
+    String text;
+};
+std::vector<Reminder> reminderList; // Holds all our downloaded reminders!
+
+// --- NEW: STOPWATCH VARIABLES ---
+volatile bool isStopwatchRunning = false;
+volatile unsigned long accumulatedStopwatchSeconds = 0;
+volatile TickType_t stopwatchStartTick = 0;
+
+// --- PHONE JAIL NOTIFICATION VARIABLES ---
+volatile bool isPhoneInJail = false;
+volatile TickType_t jailStartTime = 0;
+volatile bool showJailStartMessage = false;
+volatile TickType_t jailStartMessageTick = 0;
+volatile bool showJailSummary = false;
+volatile TickType_t summaryStartTick = 0;
+volatile int lastFocusSeconds = 0;
+
+// Display States (Sleep states removed)
+enum DisplayState {
+  STATE_AWAKE_DEFAULT,
+  STATE_AWAKE_TIMER,
+  STATE_AWAKE_STOPWATCH,
+  STATE_AWAKE_REMINDER,
+  STATE_AWAKE_FOCUS_START, 
+  STATE_AWAKE_SUMMARY,
+  STATE_INIT
+};
+
+// =======================================================
+// TASK 1: NETWORK MANAGER
+// =======================================================
+void networkTask(void *parameter) {
+    Serial.println("📡 [NETWORK] Task started. Attempting Wi-Fi connection...");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        Serial.print(".");
+    }
+    Serial.println("\n✅ [NETWORK] Wi-Fi Connected!");
+    Serial.print("🌐 [NETWORK] IP Address Assigned: ");
+    Serial.println(WiFi.localIP());
+    
+    Serial.println("🕒 [NETWORK] Requesting NTP Time Sync...");
+    configTime(19800, 0, "time.google.com");
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        Serial.println("✅ [NETWORK] Time Synced Successfully!");
+    } else {
+        Serial.println("❌ [NETWORK] WARNING: Failed to obtain local time!");
+    }
+    
+    Serial.println("🔥 [FIREBASE] Initializing connection to database...");
+    config.database_url = FIREBASE_HOST;
+    config.signer.tokens.legacy_token = FIREBASE_AUTH;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+    Serial.println("✅ [FIREBASE] Client Initialized.");
+
+    bool hasSyncedToday = false;
+    int lastPullMinute = -1; // Prevents fetching data multiple times in the same minute
+
+    for (;;) {
+        if (getLocalTime(&timeinfo)) {
+            
+            // 1. DAILY DATA PUSH (11:30 PM)
+            if (timeinfo.tm_hour == SYNC_HOUR && timeinfo.tm_min == SYNC_MINUTE && !hasSyncedToday) {
+                Serial.printf("\n☁️ [FIREBASE] --- INITIATING DAILY SYNC --- \n");
+                Serial.printf("📊 [FIREBASE] Sessions currently in local buffer: %d\n", dailyLog.size());
+                
+                if (dailyLog.size() > 0) {
+                    for (const auto& session : dailyLog) {
+                        FirebaseJson json;
+                        json.add("start", session.startTime);
+                        json.add("end", session.endTime);
+                        json.add("duration", session.durationSec);
+                        
+                        // Convert JSON to string just so we can print and verify it
+                        String jsonStr;
+                        json.toString(jsonStr, false);
+                        Serial.printf("📤 [FIREBASE] Pushing Payload: %s\n", jsonStr.c_str());
+
+                        // Attempt the actual push
+                        if (Firebase.RTDB.pushJSON(&fbdo, "/focus_sessions", &json)) {
+                            Serial.println("✅ [FIREBASE] Push Success! Saved at path: " + fbdo.dataPath());
+                        } else {
+                            Serial.println("❌ [FIREBASE] PUSH FAILED! Reason: " + fbdo.errorReason());
+                        }
+                    }
+                    dailyLog.clear(); 
+                    Serial.println("🗑️ [LOCAL LOG] Local buffer cleared for the next day.");
+                } else {
+                    Serial.println("ℹ️ [FIREBASE] No valid focus sessions to push today.");
+                }
+                Serial.println("☁️ [FIREBASE] --- DAILY SYNC COMPLETE --- \n");
+                hasSyncedToday = true;
+            }
+            
+            // Reset the sync flag at midnight
+            if (timeinfo.tm_hour == 0) hasSyncedToday = false; 
+
+            // 2. PERIODIC REMINDER PULL (Exactly once every 1 minutes)
+            if (timeinfo.tm_min %  1 == 0 && timeinfo.tm_min != lastPullMinute) {
+                lastPullMinute = timeinfo.tm_min; 
+                
+                Serial.println("\n📥 [FIREBASE] Requesting JSON reminders...");
+                
+                // Fetch the whole JSON object instead of a single string
+                if (Firebase.RTDB.getJSON(&fbdo, "/reminders")) {
+                    FirebaseJson &json = fbdo.jsonObject();
+                    size_t len = json.iteratorBegin();
+                    String key, value;
+                    int type;
+                    
+                    reminderList.clear(); // Empty the old list from memory
+                    
+                    // Loop through the JSON and pull out every time and task
+                    for (size_t i = 0; i < len; i++) {
+                        json.iteratorGet(i, type, key, value);
+                        value.replace("\"", ""); // Clean up JSON quote marks
+                        reminderList.push_back({key, value});
+                    }
+                    json.iteratorEnd();
+                    
+                    Serial.printf("✅ [FIREBASE] Loaded %d reminders from cloud.\n", reminderList.size());
+                } else {
+                    Serial.println("❌ [FIREBASE] Failed to fetch reminders! Reason: " + fbdo.errorReason());
+                }
+            }
+        }
+        
+        // Loop runs once a second to keep exact track of time without spamming
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
+    }
+}
+
+// --- UTILITY: GET TIME STRING ---
+String getTimestamp() {
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)) return "00:00:00";
+    char timeStr[20];
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+    return String(timeStr);
+}
+
+// =======================================================
+// TASK 2: BUTTON MANAGER
+// =======================================================
+void buttonTask(void *parameter) {
+  pinMode(BTN_MODE, INPUT_PULLUP);
+  pinMode(BTN_TIMER, INPUT_PULLUP);
+
+  int lastModeState = HIGH;
+  int lastTimerState = HIGH;
+
+  for (;;) {
+    int modeState = digitalRead(BTN_MODE);
+    int timerState = digitalRead(BTN_TIMER);
+
+    // --- BUTTON 1: CHANGE MODE ---
+    if (modeState == LOW && lastModeState == HIGH) {
+      currentMode = (SystemMode)((currentMode + 1) % 4); 
+      
+      if (currentMode == MODE_TIMER) {
+        lastTimerInteractionTick = xTaskGetTickCount();
+        isTimerRunning = false; 
+      }
+      
+      if (currentMode == MODE_STOPWATCH) {
+        isStopwatchRunning = false;
+        accumulatedStopwatchSeconds = 0; 
+      }
+      
+      Serial.printf("🔘 Mode Switched: %d\n", currentMode);
+    }
+    lastModeState = modeState;
+
+    // --- BUTTON 2: ACTION BUTTON ---
+    if (timerState == LOW && lastTimerState == HIGH) {
+      if (currentMode == MODE_TIMER) {
+        if (timerMinutes == 1) timerMinutes = 5;
+        else if (timerMinutes == 5) timerMinutes = 15;
+        else if (timerMinutes == 15) timerMinutes = 30;
+        else if (timerMinutes == 30) timerMinutes = 60;
+        else timerMinutes = 1; 
+        
+        lastTimerInteractionTick = xTaskGetTickCount(); 
+        isTimerRunning = false;                         
+        Serial.printf("⏱️ Timer Set To: %d min\n", timerMinutes);
+      }
+      else if (currentMode == MODE_STOPWATCH) {
+        if (isStopwatchRunning) {
+          isStopwatchRunning = false;
+          accumulatedStopwatchSeconds += (xTaskGetTickCount() - stopwatchStartTick) / 1000;
+          Serial.println("⏸️ Stopwatch Paused");
+        } else {
+          isStopwatchRunning = true;
+          stopwatchStartTick = xTaskGetTickCount();
+          Serial.println("▶️ Stopwatch Started");
+        }
+      }
+    }
+    lastTimerState = timerState;
+    vTaskDelay(pdMS_TO_TICKS(50)); 
+  }
+}
+
+// =======================================================
+// TASK 3: PHONE JAIL RFID
+// =======================================================
+void rfidTask(void *parameter) {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    mfrc522.PCD_Init();
+    xSemaphoreGive(spiMutex);
+  }
+  
+  TickType_t lastCardSeenTime = 0;
+  String sessionStartStr; 
+
+  for (;;) {
+    TickType_t currentTick = xTaskGetTickCount();
+    MFRC522::StatusCode status;
+    byte bufferATQA[2];
+    byte bufferSize = sizeof(bufferATQA);
+
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      status = mfrc522.PICC_WakeupA(bufferATQA, &bufferSize);
+      if (status == MFRC522::STATUS_OK && mfrc522.PICC_ReadCardSerial()) {
+        mfrc522.PICC_HaltA(); 
+      }
+      xSemaphoreGive(spiMutex);
+    }
+
+    if (status == MFRC522::STATUS_OK) {
+      lastCardSeenTime = currentTick;
+      
+      if (!isPhoneInJail) {
+        isPhoneInJail = true;
+        jailStartTime = currentTick;
+        sessionStartStr = getTimestamp(); 
+        
+        showJailStartMessage = true;          
+        jailStartMessageTick = currentTick;   
+        showJailSummary = false;              
+        
+        Serial.println("\n🔒 Phone Locked in Jail! Focus time started.");
+      }
+    } else {
+      if (isPhoneInJail && (currentTick - lastCardSeenTime > pdMS_TO_TICKS(RFID_TIMEOUT_MS))) {
+        
+        isPhoneInJail = false;
+        int duration = (currentTick - jailStartTime - pdMS_TO_TICKS(RFID_TIMEOUT_MS)) / 1000;
+        lastFocusSeconds = duration; 
+        
+        Serial.printf("\n📱 [RFID] Phone removed. Total focus duration: %d seconds.\n", duration);
+        if (duration >= 900) {
+            dailyLog.push_back({sessionStartStr, getTimestamp(), duration});
+            Serial.println("💾 Session valid (>15m). Saved to local buffer for 11:30 PM sync.");
+        } else {
+            Serial.println("⚠️ Session too short (<15m), discarded from Firebase log.");
+        }
+        
+        showJailStartMessage = false;         
+        showJailSummary = true;               
+        summaryStartTick = currentTick;       
+        
+        Serial.printf("🔓 Phone Removed! Focused for %d seconds\n", lastFocusSeconds);
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(500)); 
+  }
+}
+
+// =======================================================
+// TASK 4: DISPLAY MANAGER (ALWAYS ON)
+// =======================================================
+void displayTask(void *parameter) {
+  vTaskDelay(pdMS_TO_TICKS(500));
+  
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+    tft.initR(INITR_BLACKTAB);
+    tft.setRotation(1);
+    tft.fillScreen(ST77XX_BLACK);
+    xSemaphoreGive(spiMutex);
+  }
+
+  DisplayState currentState = STATE_INIT; 
+  int lastDrawnTimerSecond = -1; 
+  int lastDrawnStopwatchSecond = -1; 
+  int lastSetupCountdown = -1; 
+
+  for (;;) {
+    TickType_t currentTick = xTaskGetTickCount();
+
+    // --- NOTIFICATION OVERRIDE A: FOCUS STARTED ---
+    if (showJailStartMessage) {
+      if (currentState != STATE_AWAKE_FOCUS_START) {
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+          tft.fillScreen(ST77XX_BLACK);
+          tft.setCursor(5, 50);
+          tft.setTextColor(ST77XX_MAGENTA);
+          tft.setTextSize(2);
+          tft.print("FOCUS MODE");
+          tft.setCursor(20, 80);
+          tft.setTextColor(ST77XX_WHITE);
+          tft.setTextSize(1);
+          tft.print("Tracking started...");
+          xSemaphoreGive(spiMutex);
+        }
+        currentState = STATE_AWAKE_FOCUS_START;
+      }
+      if (currentTick - jailStartMessageTick > pdMS_TO_TICKS(FOCUS_POPUP_MS)) {
+        showJailStartMessage = false;
+        currentState = STATE_INIT; // Force a redraw of standard modes
+      }
+    }
+    
+    // --- NOTIFICATION OVERRIDE B: FOCUS SUMMARY ---
+    else if (showJailSummary) {
+      if (currentState != STATE_AWAKE_SUMMARY) {
+        if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+          tft.fillScreen(ST77XX_BLACK);
+          tft.setCursor(5, 30);
+          tft.setTextColor(ST77XX_CYAN);
+          tft.setTextSize(2);
+          tft.print("FOCUS OVER");
+          tft.setCursor(25, 70);
+          tft.setTextColor(ST77XX_WHITE);
+          tft.setTextSize(3);
+          tft.printf("%02d:%02d", lastFocusSeconds / 60, lastFocusSeconds % 60);
+          xSemaphoreGive(spiMutex);
+        }
+        currentState = STATE_AWAKE_SUMMARY;
+      }
+      if (currentTick - summaryStartTick > pdMS_TO_TICKS(FOCUS_POPUP_MS)) {
+        showJailSummary = false;
+        currentState = STATE_INIT; // Force a redraw of standard modes
+      }
+    }
+
+    // --- STANDARD MODES ---
+    else {
+      
+      // --- MODE 0: CYBERPUNK IMAGE ---
+      if (currentMode == MODE_DEFAULT) {
+        if (currentState != STATE_AWAKE_DEFAULT) {
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            tft.fillScreen(ST77XX_BLACK);
+            tft.drawRGBBitmap(15, 0, goodmannn, 128, 160);
+            xSemaphoreGive(spiMutex);
+          }
+          currentState = STATE_AWAKE_DEFAULT;
+        }
+      }
+      
+      // --- MODE 1: COUNTDOWN TIMER ---
+      else if (currentMode == MODE_TIMER) {
+        bool justWokeUp = (currentState != STATE_AWAKE_TIMER);
+        currentState = STATE_AWAKE_TIMER; 
+        
+        if (!isTimerRunning) {
+          long waitTimeRemaining = TIMER_AUTOSTART_SEC - ((currentTick - lastTimerInteractionTick) / 1000);
+          if (waitTimeRemaining <= 0) {
+            isTimerRunning = true;
+            timerStartTick = currentTick;
+            lastDrawnTimerSecond = -1; 
+            if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+               tft.fillScreen(ST77XX_BLACK);
+               xSemaphoreGive(spiMutex);
+            }
+          } 
+          else if (waitTimeRemaining != lastSetupCountdown || justWokeUp) {
+            if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+              tft.fillScreen(ST77XX_BLACK);
+              tft.setCursor(10, 30);
+              tft.setTextColor(ST77XX_GREEN);
+              tft.setTextSize(2);
+              tft.print("TIMER SETUP");
+              tft.setCursor(30, 60);
+              tft.setTextColor(ST77XX_WHITE);
+              tft.setTextSize(3);
+              tft.printf("%02d M", timerMinutes);
+              tft.setCursor(15, 100);
+              tft.setTextColor(ST77XX_YELLOW);
+              tft.setTextSize(1);
+              tft.printf("Auto-start in %d...", waitTimeRemaining);
+              xSemaphoreGive(spiMutex);
+            }
+            lastSetupCountdown = waitTimeRemaining;
+          }
+        }
+        else {
+          long elapsedSeconds = (currentTick - timerStartTick) / 1000;
+          long totalSeconds = timerMinutes * 60;
+          long remainingSeconds = totalSeconds - elapsedSeconds;
+
+          if (remainingSeconds > 0) {
+            if (remainingSeconds != lastDrawnTimerSecond || justWokeUp) {
+              long m = remainingSeconds / 60;
+              long s = remainingSeconds % 60;
+              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                if (justWokeUp) tft.fillScreen(ST77XX_BLACK);
+                tft.setCursor(15, 60);
+                tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK); 
+                tft.setTextSize(3);
+                tft.printf("%02d:%02d", m, s);
+                xSemaphoreGive(spiMutex);
+              }
+              lastDrawnTimerSecond = remainingSeconds;
+            }
+          } 
+          else {
+            if (lastDrawnTimerSecond != 0 || justWokeUp) {
+              if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+                tft.fillScreen(ST77XX_RED);
+                tft.setCursor(15, 60);
+                tft.setTextColor(ST77XX_WHITE, ST77XX_RED);
+                tft.setTextSize(3);
+                tft.print("TIME UP!");
+                xSemaphoreGive(spiMutex);
+              }
+              if (lastDrawnTimerSecond != 0) timeUpStartTick = currentTick; 
+              lastDrawnTimerSecond = 0; 
+            }
+            if (currentTick - timeUpStartTick > pdMS_TO_TICKS(TIME_UP_DISPLAY_MS)) {
+               currentMode = MODE_DEFAULT;     
+               isTimerRunning = false;         
+               timerMinutes = 1;               
+               currentState = STATE_INIT; // Force redraw
+            }
+          }
+        }
+      }
+      
+      // --- MODE 2: STOPWATCH ---
+      else if (currentMode == MODE_STOPWATCH) {
+        bool justWokeUp = (currentState != STATE_AWAKE_STOPWATCH);
+        currentState = STATE_AWAKE_STOPWATCH; 
+        
+        unsigned long currentElapsed = accumulatedStopwatchSeconds;
+        
+        if (isStopwatchRunning) {
+           currentElapsed += (currentTick - stopwatchStartTick) / 1000;
+        }
+        
+        if (currentElapsed != lastDrawnStopwatchSecond || justWokeUp) {
+          long m = currentElapsed / 60;
+          long s = currentElapsed % 60;
+          
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            if (justWokeUp) {
+              tft.fillScreen(ST77XX_BLACK);
+              tft.setCursor(10, 30);
+              tft.setTextColor(ST77XX_ORANGE);
+              tft.setTextSize(2);
+              tft.print("STOPWATCH");
+            }
+            
+            tft.setCursor(20, 60);
+            tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK); 
+            tft.setTextSize(3);
+            tft.printf("%02d:%02d", m, s);
+            
+            tft.setCursor(35, 100);
+            tft.setTextSize(1);
+            if (isStopwatchRunning) {
+              tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+              tft.print(" RUNNING "); 
+            } else {
+              tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+              tft.print(" PAUSED  ");
+            }
+            
+            xSemaphoreGive(spiMutex);
+          }
+          lastDrawnStopwatchSecond = currentElapsed;
+        }
+      }
+      
+      // --- MODE 3: REMINDER ---
+      else if (currentMode == MODE_REMINDER) {
+        if (currentState != STATE_AWAKE_REMINDER) {
+          if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+            tft.fillScreen(ST77XX_BLACK);
+            tft.setCursor(15, 20);
+            tft.setTextColor(ST77XX_BLUE);
+            tft.setTextSize(2);
+            tft.print("REMINDERS");
+            
+            tft.setTextSize(1);
+            int yOffset = 50; 
+            
+            if (reminderList.empty()) {
+                tft.setCursor(15, yOffset);
+                tft.setTextColor(ST77XX_WHITE);
+                tft.print("No reminders today!");
+            } else {
+                for (size_t i = 0; i < reminderList.size(); i++) {
+                    if (yOffset > 140) break; 
+                    
+                    tft.setTextColor(ST77XX_YELLOW);
+                    tft.setCursor(5, yOffset);
+                    tft.print(reminderList[i].time);
+                    
+                    tft.setTextColor(ST77XX_WHITE);
+                    tft.setCursor(65, yOffset);
+                    tft.print(reminderList[i].text.substring(0, 13)); 
+                    
+                    yOffset += 20; 
+                }
+            }
+            xSemaphoreGive(spiMutex);
+          }
+          currentState = STATE_AWAKE_REMINDER;
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+}
+
+// =======================================================
+// TASK 5: I2C SECONDARY DISPLAY
+// =======================================================
+void clockTask(void *parameter) {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if(!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("SSD1306 allocation failed"));
+    vTaskDelete(NULL);
+  }
+  
+  for(;;) {
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)) {
+      oled.clearDisplay();
+      oled.setTextColor(SSD1306_WHITE);
+      
+      oled.setCursor(15, 20); 
+      oled.setTextSize(3);
+      oled.printf("%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      
+      oled.setCursor(55, 50);
+      oled.setTextSize(1);
+      oled.printf("%02d", timeinfo.tm_sec);
+      
+      oled.display();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// =======================================================
+// MAIN SETUP
+// =======================================================
+void setup() {
+  Serial.begin(115200);
+  
+  spiMutex = xSemaphoreCreateMutex();
+  SPI.begin(18, 19, 23); // (MOSI=18, MISO=19, SCK=23)
+
+  if (spiMutex != NULL) {
+    xTaskCreatePinnedToCore(networkTask, "Network", 16384, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(buttonTask,  "Buttons", 2048,  NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(rfidTask,    "RFID",    8192,  NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(displayTask, "Display", 10240, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(clockTask,   "Clock",   2048,  NULL, 1, NULL, 1);
+  }
+  
+  vTaskDelete(NULL);
+}
+
+void loop() {}
